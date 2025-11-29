@@ -1,0 +1,142 @@
+# ==============================================================================
+# 1. ライブラリのインストールとインポート
+# ==============================================================================
+
+# 必要なライブラリのインストール
+!pip install -q pandas numpy scikit-learn lightgbm optuna
+
+# 必要なライブラリのインポート
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import roc_auc_score
+import lightgbm as lgb
+import warnings
+
+# 警告メッセージを非表示に設定
+warnings.filterwarnings('ignore')
+
+print("1. ライブラリのインポートが完了しました。")
+
+# ==============================================================================
+# 2. データ読み込みと前処理・特徴量エンジニアリング
+# ==============================================================================
+
+## データの読み込み
+try:
+    # ファイル名が 'train.csv', 'test.csv', 'submit_sample.csv' であることを想定
+    train_df = pd.read_csv('train.csv')
+    test_df = pd.read_csv('test.csv')
+    # submit_sample.csv は提出形式確認用なので今回は直接は使わない
+except FileNotFoundError:
+    print("エラー: 必要なファイルが見つかりません。train.csv, test.csv がColabにアップロードされているか確認してください。")
+    exit()
+
+# ターゲット変数の定義と抽出
+TARGET_COL = 'y' # ★修正済み: ターゲット列名を 'y' に設定
+y = train_df[TARGET_COL]
+
+# 提出時に使用する元のIDを保存 ★重要: IDの不一致エラー対策
+original_test_ids = test_df['id'].copy()
+
+# ID列とターゲット列を削除し、train/testを結合して一括で前処理
+train_df = train_df.drop([TARGET_COL, 'id'], axis=1)
+test_df = test_df.drop('id', axis=1)
+all_df = pd.concat([train_df, test_df], ignore_index=True)
+
+# -----------------
+# 特徴量エンジニアリングと前処理
+# -----------------
+
+# 1. カテゴリ変数の処理: Label Encoding
+categorical_cols = all_df.select_dtypes(include='object').columns
+
+for col in categorical_cols:
+    le = LabelEncoder()
+    all_df[col] = le.fit_transform(all_df[col])
+
+# 2. 数値特徴量の処理
+# 'pdays'が-1（過去に接触なし）の場合を別のカテゴリとして扱う
+all_df['pdays_flag'] = all_df['pdays'].apply(lambda x: 1 if x != -1 else 0)
+all_df['pdays'] = all_df['pdays'].replace(-1, 0)
+
+# 3. train/testの再分割
+X = all_df.iloc[:len(y), :]
+X_test = all_df.iloc[len(y):, :]
+
+print(f"2. データの前処理が完了しました。特徴量Xの形状: {X.shape}")
+
+
+# ==============================================================================
+# 3. LightGBMモデル学習と予測 (K-Fold Cross Validation)
+# ==============================================================================
+
+# Stratified K-Fold Cross Validationの設定
+N_SPLITS = 5
+kf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
+
+# OOF (Out-Of-Fold) 予測とテストデータの予測結果を格納する配列
+oof_preds = np.zeros(X.shape[0])
+test_preds = np.zeros(X_test.shape[0])
+
+# LightGBMのハイパーパラメータ設定（高精度ベースライン）
+lgb_params = {
+    'objective': 'binary',
+    'metric': 'auc',
+    'boosting_type': 'gbdt',
+    'n_estimators': 10000, # 試行回数を多くし、early_stoppingで調整
+    'learning_rate': 0.01, # 小さくして精度向上を狙う
+    'num_leaves': 20,
+    'max_depth': 5, # 浅くして過学習を抑制
+    'seed': 42,
+    'n_jobs': -1,
+    'verbose': -1,
+    'colsample_bytree': 0.8,
+    'subsample': 0.8,
+    'reg_alpha': 0.1,
+    'reg_lambda': 0.1,
+    'early_stopping_round': 100 # 改善がなければ100回で停止
+}
+
+print("3. LightGBMモデルの学習を開始します...")
+for fold, (train_index, val_index) in enumerate(kf.split(X, y)):
+    print(f"--- Fold {fold+1}/{N_SPLITS} ---")
+
+    X_train, X_val = X.iloc[train_index], X.iloc[val_index]
+    y_train, y_val = y.iloc[train_index], y.iloc[val_index]
+
+    model = lgb.LGBMClassifier(**lgb_params)
+
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        eval_metric='auc'
+    )
+
+    # OOF予測 (Validationデータの予測)
+    oof_preds[val_index] = model.predict_proba(X_val)[:, 1]
+
+    # Testデータの予測 (平均化のため、各Foldの結果を加算)
+    test_preds += model.predict_proba(X_test)[:, 1] / kf.n_splits
+
+# CV全体のAUCを計算
+cv_auc = roc_auc_score(y, oof_preds)
+print(f"\n--- ⭐️ CV Overall AUC: {cv_auc:.6f} ⭐️ ---")
+
+
+# ==============================================================================
+# 4. 提出ファイルの作成
+# ==============================================================================
+
+# 提出ファイルの形式を確認 (IDと予測確率の2列、ヘッダなし)
+submission_df = pd.DataFrame({
+    0: original_test_ids, # 1列目: 正しく保存した元のIDを使用
+    1: test_preds.round(6)  # 2列目: 予測確率値 (0から1の実数)、小数点以下6桁に丸める
+})
+
+# ヘッダなし、インデックスなしでCSV保存
+submission_df.to_csv('submission_lgbm_cv.csv', header=False, index=False)
+
+print("\n4. 提出ファイル `submission_lgbm_cv.csv` が作成されました。")
+print("これをダウンロードしてSIGNATEに提出してください。")
